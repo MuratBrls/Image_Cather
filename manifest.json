@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Deep-Extract Image Downloader",
   "version": "1.2.0",
-  "description": "Bypasses transparent overlay protections to forcefully extract and download the underlying image asset at your right-click coordinates.",
+  "description": "Bypasses protected layers to forcefully extract and download the underlying image asset at your right-click coordinates.",
   "permissions": [
     "contextMenus",
     "activeTab",
