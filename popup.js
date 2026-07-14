@@ -80,6 +80,30 @@ $('saveBtn').addEventListener('click', async () => {
   setTimeout(() => { msg.textContent = ''; }, 2000);
 });
 
+// ─── Screenshot Button Handler ───────────────────────────────────────────────
+
+$('ssBtn').addEventListener('click', async () => {
+  const btn = $('ssBtn');
+  const originalHtml = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span>📸</span> Capture...';
+
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "CAPTURE_VISIBLE" });
+    if (response?.success) {
+      // Reload history to show the new screenshot item in the list
+      await loadHistory();
+    } else {
+      console.error('[Deep-Extract] Screenshot failed:', response?.error);
+    }
+  } catch (err) {
+    console.error('[Deep-Extract] Failed to request screenshot:', err);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalHtml;
+  }
+});
+
 // ─── History ──────────────────────────────────────────────────────────────────
 async function loadHistory() {
   const { downloadHistory = [] } = await chrome.storage.local.get("downloadHistory");

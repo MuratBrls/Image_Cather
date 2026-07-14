@@ -1,14 +1,22 @@
 /**
  * background.js — Deep-Extract Image Downloader v1.2
  * Background Service Worker (Manifest V3)
+ *
+ * New in v1.2:
+ *  - Added context menu for page view screenshot ("Capture Page View").
+ *  - Added message handler for screenshot capture from popup.
+ *  - Uses OffscreenCanvas in the service worker to generate lightweight thumbnails
+ *    for screenshots in the history panel.
  */
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const MENU_ITEM_ID    = "deep_extract_download";
-const MENU_ITEM_TITLE = "⬇️ Force Download Image";
-const MSG_EXTRACT     = "DEEP_EXTRACT_IMAGE";
-const MAX_HISTORY     = 60;
+const MENU_ITEM_ID      = "deep_extract_download";
+const MENU_ITEM_TITLE   = "⬇️ Force Download Image";
+const MENU_ITEM_SS_ID   = "deep_extract_screenshot";
+const MENU_ITEM_SS_TITLE  = "📸 Capture Page View";
+const MSG_EXTRACT       = "DEEP_EXTRACT_IMAGE";
+const MAX_HISTORY       = 60;
 
 // ─── Default Settings ─────────────────────────────────────────────────────────
 
@@ -24,12 +32,21 @@ const DEFAULTS = {
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
+    // 1. Force Download context item
     chrome.contextMenus.create({
       id: MENU_ITEM_ID,
       title: MENU_ITEM_TITLE,
       contexts: ["all"],
     });
-    console.log("[Deep-Extract] Context menu registered.");
+
+    // 2. Screenshot context item
+    chrome.contextMenus.create({
+      id: MENU_ITEM_SS_ID,
+      title: MENU_ITEM_SS_TITLE,
+      contexts: ["page", "frame", "selection", "link"],
+    });
+
+    console.log("[Deep-Extract] Context menus registered.");
   });
 
   chrome.storage.sync.get(DEFAULTS, (stored) => {
@@ -43,108 +60,198 @@ chrome.runtime.onInstalled.addListener(() => {
 // ─── Context Menu Click Handler ───────────────────────────────────────────────
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId !== MENU_ITEM_ID) return;
   if (!tab?.id) return;
 
-  const settings = await getSettings();
-  let imageUrl = null;
+  if (info.menuItemId === MENU_ITEM_ID) {
+    // --- FORCE DOWNLOAD FLOW ---
+    const settings = await getSettings();
+    let imageUrl = null;
 
-  try {
-    const response = await sendMessageWithFallback(tab.id, { type: MSG_EXTRACT });
-    imageUrl = response?.url ?? null;
-  } catch (err) {
-    console.error("[Deep-Extract] Content script unreachable:", err.message);
-    if (settings.toasts) await injectToast(tab.id, "Could not reach the page script.", "error");
-    return;
-  }
-
-  if (!imageUrl) {
-    if (settings.toasts) await injectToast(tab.id, "No image found at that location.", "error");
-    return;
-  }
-
-  // ── Duplicate Guard ───────────────────────────────────────────────────────
-  // Strategy: only BLOCK re-downloads that happen within 3 seconds of the
-  // previous download of the same URL (true accidental double-click).
-  // After 3 seconds: show an informational toast but still proceed.
-  // This avoids false-positive blocks when a site uses the same CDN URL
-  // structure for different products (e.g. all images loaded from same base URL).
-  if (settings.dedup) {
-    const { downloadHistory = [] } = await chrome.storage.local.get("downloadHistory");
-    const historyEntry = downloadHistory.find((h) => h.url === imageUrl);
-
-    if (historyEntry) {
-      const secondsSince = (Date.now() - (historyEntry.ts ?? 0)) / 1000;
-
-      if (secondsSince < 3) {
-        // True double-click — block silently.
-        console.info("[Deep-Extract] Double-click guard triggered, skipping.");
-        return;
-      }
-
-      // URL seen before but not a double-click.
-      // Check if the file still exists on disk; if so, warn the user.
-      const fileExists = await checkDownloadExists(historyEntry.downloadId, imageUrl);
-      if (fileExists && settings.toasts) {
-        // Warn but DO NOT block — the user may be intentionally downloading
-        // a different image that shares the same URL (CDN reuse, placeholders, etc.)
-        await injectToast(tab.id, "Heads up: you've downloaded this URL before.", "warn");
-      }
-      // Continue to download regardless.
+    try {
+      const response = await sendMessageWithFallback(tab.id, { type: MSG_EXTRACT });
+      imageUrl = response?.url ?? null;
+    } catch (err) {
+      console.error("[Deep-Extract] Content script unreachable:", err.message);
+      if (settings.toasts) await injectToast(tab.id, "Could not reach the page script.", "error");
+      return;
     }
+
+    if (!imageUrl) {
+      if (settings.toasts) await injectToast(tab.id, "No image found at that location.", "error");
+      return;
+    }
+
+    // Duplicate Guard
+    if (settings.dedup) {
+      const { downloadHistory = [] } = await chrome.storage.local.get("downloadHistory");
+      const historyEntry = downloadHistory.find((h) => h.url === imageUrl);
+
+      if (historyEntry) {
+        const secondsSince = (Date.now() - (historyEntry.ts ?? 0)) / 1000;
+        if (secondsSince < 3) {
+          console.info("[Deep-Extract] Double-click guard triggered, skipping.");
+          return;
+        }
+
+        const fileExists = await checkDownloadExists(historyEntry.downloadId, imageUrl);
+        if (fileExists && settings.toasts) {
+          await injectToast(tab.id, "Heads up: you've downloaded this URL before.", "warn");
+        }
+      }
+    }
+
+    await run(imageUrl, tab, settings);
+
+  } else if (info.menuItemId === MENU_ITEM_SS_ID) {
+    // --- SCREENSHOT CAPTURE FLOW ---
+    await captureScreenshot(tab);
   }
-
-
-  await run(imageUrl, tab, settings);
 });
 
 // ─── Shared download flow (used by context menu + re-download) ────────────────
 
-async function run(imageUrl, tab, settings) {
+async function run(imageUrl, tab, settings, isScreenshot = false) {
   const downloadId = await initiateDownload(imageUrl, tab, settings);
+  if (downloadId == null) return;
 
-  if (downloadId == null) return; // initiateDownload handles its own error toast
+  // For screenshot history, the url itself is the screenshot dataURL.
+  // We will downscale it to keep the history list lightweight.
+  let thumbUrl = imageUrl;
+  if (isScreenshot) {
+    thumbUrl = await createThumbnail(imageUrl, 150, 150);
+  }
 
-  // Save to history with the real downloadId for later disk existence checks.
   await appendHistory({
     url:        imageUrl,
-    thumb:      imageUrl,
+    thumb:      thumbUrl,
     downloadId,
     pageUrl:    tab?.url ?? imageUrl,
     ts:         Date.now(),
+    isScreenshot,
   });
 
   const { sessionDownloads = 0 } = await chrome.storage.local.get("sessionDownloads");
   await chrome.storage.local.set({ sessionDownloads: sessionDownloads + 1 });
 
-  if (settings.toasts) await injectToast(tab?.id, "Download started.", "success");
+  if (settings.toasts) {
+    await injectToast(tab?.id, isScreenshot ? "Screenshot saved." : "Download started.", "success");
+  }
 }
 
-// ─── Re-download from History Panel ──────────────────────────────────────────
+// ─── Message Listener (Handles Re-download & Screenshot from Popup) ──────────
 
-chrome.runtime.onMessage.addListener((message, _sender) => {
-  if (message?.type !== "REDOWNLOAD") return false;
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === "CAPTURE_VISIBLE") {
+    (async () => {
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const res = await captureScreenshot(tab);
+        sendResponse(res);
+      } catch (err) {
+        sendResponse({ success: false, error: err.message });
+      }
+    })();
+    return true; // Keep message channel open for async response
+  }
 
-  (async () => {
-    const settings = await getSettings();
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    // Re-downloads always bypass the duplicate guard.
-    await run(message.url, tab, { ...settings, dedup: false });
-  })();
+  if (message?.type === "REDOWNLOAD") {
+    (async () => {
+      const settings = await getSettings();
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const isScreenshot = message.url.startsWith("data:image/");
+      await run(message.url, tab, { ...settings, dedup: false }, isScreenshot);
+    })();
+    return false;
+  }
 
   return false;
 });
 
-// ─── Download Logic ───────────────────────────────────────────────────────────
+// ─── Screenshot Flow ──────────────────────────────────────────────────────────
 
 /**
- * Starts a download and returns the download ID, or null on failure.
+ * Captures the visible area of the active tab and starts downloading it.
+ * Saves a lightweight downscaled thumbnail to storage history.
  *
- * @param {string} url
- * @param {chrome.tabs.Tab|undefined} tab
- * @param {object} settings
- * @returns {Promise<number|null>}
+ * @param {chrome.tabs.Tab} tab
+ * @returns {Promise<{ success: boolean, error?: string }>}
  */
+async function captureScreenshot(tab) {
+  if (!tab?.id || !tab?.windowId) {
+    throw new Error("No active window/tab context found.");
+  }
+
+  const settings = await getSettings();
+
+  try {
+    // 1. Capture viewport as PNG data URL
+    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+
+    // 2. Trigger download flow using run()
+    await run(dataUrl, tab, settings, true);
+
+    return { success: true };
+  } catch (err) {
+    console.error("[Deep-Extract] Screenshot capture failed:", err.message);
+    if (tab?.id && settings.toasts) {
+      await injectToast(tab.id, `Screenshot failed: ${err.message}`, "error");
+    }
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Compresses a screenshot data URL into a lightweight thumbnail blob using
+ * OffscreenCanvas in the Service Worker.
+ *
+ * @param {string} dataUrl
+ * @param {number} maxWidth
+ * @param {number} maxHeight
+ * @returns {Promise<string>} Base64 thumbnail data URL.
+ */
+async function createThumbnail(dataUrl, maxWidth, maxHeight) {
+  try {
+    const res = await fetch(dataUrl);
+    const blob = await res.blob();
+    const img = await createImageBitmap(blob);
+
+    let width = img.width;
+    let height = img.height;
+
+    if (width > height) {
+      if (width > maxWidth) {
+        height = Math.round(height * (maxWidth / width));
+        width = maxWidth;
+      }
+    } else {
+      if (height > maxHeight) {
+        width = Math.round(width * (maxHeight / height));
+        height = maxHeight;
+      }
+    }
+
+    const canvas = new OffscreenCanvas(width, height);
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0, width, height);
+
+    const thumbBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.70 });
+    
+    // Safely convert Blob to Base64 in Service Worker
+    const buffer = await thumbBlob.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    for (let i = 0; i < bytes.byteLength; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return `data:image/jpeg;base64,${btoa(binary)}`;
+  } catch (err) {
+    console.warn("[Deep-Extract] Failed to make thumbnail, using original:", err.message);
+    return dataUrl;
+  }
+}
+
+// ─── Download Logic ───────────────────────────────────────────────────────────
+
 async function initiateDownload(url, tab, settings) {
   const filename = deriveFilename(url, tab?.url, settings);
 
@@ -173,8 +280,13 @@ async function initiateDownload(url, tab, settings) {
 
 function deriveFilename(imageUrl, pageUrl, settings) {
   const folder = sanitizeFolder(settings.folder);
-  const ext    = extractExtension(imageUrl) || "jpg";
+  const ext    = extractExtension(imageUrl) || "png";
   const ts     = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+
+  // If it's a screenshot data URL, name it screenshot-timestamp.ext
+  if (imageUrl.startsWith("data:image/") || imageUrl.includes("base64")) {
+    return `${folder}/screenshot-${ts}.${ext}`;
+  }
 
   switch (settings.naming) {
     case "timestamp":
@@ -207,6 +319,10 @@ function extractOriginalName(url) {
 }
 
 function extractExtension(url) {
+  if (url.startsWith("data:image/")) {
+    const m = url.match(/^data:image\/([a-zA-Z+]+);/);
+    if (m) return m[1] === "jpeg" ? "jpg" : m[1];
+  }
   try {
     const name = new URL(url).pathname.split("/").pop() ?? "";
     const m    = name.match(/\.(jpg|jpeg|png|gif|webp|avif|svg|bmp|tiff?)$/i);
@@ -225,38 +341,15 @@ async function appendHistory(entry) {
 
 // ─── Disk Existence Check ─────────────────────────────────────────────────────
 
-/**
- * Reliably determines if a downloaded file still exists on disk.
- *
- * Chrome's `DownloadItem.exists` flag is stale by default. According to MDN/Chrome docs,
- * calling search() TRIGGERS a background existence refresh, but the results returned
- * by that same call may still be stale. The fix: call search() once to trigger the
- * refresh, wait briefly for Chrome to update, then call search() again to read the
- * now-fresh `exists` value.
- *
- * Falls back to URL-based search if no downloadId is stored.
- *
- * @param {number|undefined} downloadId  - The stored chrome.downloads ID.
- * @param {string}           url         - The image URL as a fallback key.
- * @returns {Promise<boolean>}
- */
 async function checkDownloadExists(downloadId, url) {
   try {
-    // Build the search query — prefer ID lookup (exact match), fall back to URL.
     const query = downloadId != null ? { id: downloadId } : { url, limit: 10 };
-
-    // First call triggers Chrome's background file-existence check.
     await chrome.downloads.search(query);
-
-    // Give Chrome ~400ms to refresh the exists flag.
     await new Promise((resolve) => setTimeout(resolve, 400));
-
-    // Second call reads the freshly updated value.
     const results = await chrome.downloads.search(query);
-
     return results.some((d) => d.state === "complete" && d.exists === true);
   } catch {
-    return false; // On any error, allow the download.
+    return false;
   }
 }
 
@@ -300,20 +393,13 @@ async function injectToast(tabId, message, type = "success") {
   }
 }
 
-/**
- * Self-contained toast renderer — runs in page context, no service-worker refs.
- * Design: clean white card, colored icon circle, bold title, body message.
- *
- * @param {string} message
- * @param {"success"|"error"|"warn"} type
- */
 function renderToast(message, type) {
   const ID = "__deep_extract_toast__";
   document.getElementById(ID)?.remove();
 
   const cfg = {
-    success: { icon: "✓", color: "#16a34a", label: "Downloaded"    },
-    warn:    { icon: "!", color: "#d97706", label: "Already saved"  },
+    success: { icon: "✓", color: "#16a34a", label: "Success"        },
+    warn:    { icon: "!", color: "#d97706", label: "Warning"        },
     error:   { icon: "✕", color: "#dc2626", label: "Failed"         },
   }[type] || { icon: "✓", color: "#16a34a", label: "Done" };
 
@@ -342,7 +428,6 @@ function renderToast(message, type) {
     transition:  "opacity 0.22s ease, transform 0.22s ease",
   });
 
-  // Icon circle
   const icon = document.createElement("div");
   Object.assign(icon.style, {
     width:           "30px",
@@ -360,7 +445,6 @@ function renderToast(message, type) {
   });
   icon.textContent = cfg.icon;
 
-  // Text block
   const textWrap = document.createElement("div");
 
   const title = document.createElement("div");
